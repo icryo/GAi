@@ -1,0 +1,220 @@
+# %% [markdown]
+# # Combining PDFs from S3 Using AWS Bedrock Embeddings
+# 
+# In this notebook we will:
+# 
+# 1. **Download PDFs from S3:** Read PDFs stored in an S3 bucket.
+# 2. **Extract Text:** Use PyPDF2 to extract text from each PDF.
+# 3. **Get Embeddings via AWS Bedrock:** Use Bedrock’s embedding service to get semantic representations.
+# 4. **Cluster PDFs:** Use Agglomerative Clustering (and KMeans for subdividing large clusters) so that no cluster has more than 100 PDFs.
+# 5. **Combine Clusters:** Combine the text from PDFs in each cluster into a single text file.
+# 
+# Make sure you have the required IAM permissions for S3 and AWS Bedrock.
+
+# %% [code]
+import os
+import math
+import json
+from collections import defaultdict
+
+import boto3
+import numpy as np
+import PyPDF2
+from sklearn.cluster import AgglomerativeClustering, KMeans
+from sklearn.metrics.pairwise import cosine_similarity
+
+# Set up S3 parameters
+s3_bucket = 'your-input-bucket-name'   # Replace with your S3 bucket name containing PDFs
+s3_prefix = 'path/to/pdfs/'              # (Optional) prefix if PDFs are stored in a subfolder
+
+# Local directories for processing and output
+local_pdf_dir = "pdfs"
+output_directory = "combined"
+os.makedirs(local_pdf_dir, exist_ok=True)
+os.makedirs(output_directory, exist_ok=True)
+
+# %% [markdown]
+# ## Download PDFs from S3
+# 
+# This cell lists PDF objects in your S3 bucket (and optional prefix) and downloads them locally.
+
+# %% [code]
+s3_client = boto3.client('s3')
+
+def download_pdfs_from_s3(bucket, prefix, download_dir):
+    paginator = s3_client.get_paginator('list_objects_v2')
+    downloaded_files = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get('Contents', []):
+            key = obj['Key']
+            if key.lower().endswith('.pdf'):
+                local_path = os.path.join(download_dir, os.path.basename(key))
+                s3_client.download_file(bucket, key, local_path)
+                downloaded_files.append(local_path)
+                print(f"Downloaded {key} to {local_path}")
+    return downloaded_files
+
+pdf_file_paths = download_pdfs_from_s3(s3_bucket, s3_prefix, local_pdf_dir)
+print(f"Total PDFs downloaded: {len(pdf_file_paths)}")
+
+# %% [markdown]
+# ## Extract Text from PDFs
+# 
+# We use PyPDF2 to extract text from each PDF. If a PDF is image-based, you might consider integrating an OCR solution.
+
+# %% [code]
+def extract_text_from_pdf(pdf_path):
+    text = ""
+    try:
+        with open(pdf_path, "rb") as f:
+            reader = PyPDF2.PdfReader(f)
+            for page in reader.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text + "\n"
+    except Exception as e:
+        print(f"Error processing {pdf_path}: {e}")
+    return text
+
+pdf_texts = []
+valid_pdf_paths = []
+for pdf_path in pdf_file_paths:
+    text = extract_text_from_pdf(pdf_path)
+    if text.strip():
+        pdf_texts.append(text)
+        valid_pdf_paths.append(pdf_path)
+    else:
+        print(f"No text extracted from {pdf_path}")
+
+print(f"Extracted text from {len(pdf_texts)} PDFs.")
+
+# %% [markdown]
+# ## Get Embeddings via AWS Bedrock
+# 
+# We define a function that calls the Bedrock embedding API. Replace `'your-bedrock-model-id'` with your actual model identifier. 
+# 
+# **Note:** Adjust the payload format and response parsing as needed based on your Bedrock model's specifications.
+
+# %% [code]
+bedrock_client = boto3.client('bedrock-runtime')  # Optionally specify region_name if needed
+
+def get_bedrock_embedding(text):
+    """
+    Call AWS Bedrock to get the embedding for the input text.
+    Assumes the model returns a JSON with an 'embedding' field containing a list of floats.
+    """
+    payload = json.dumps({"text": text})
+    try:
+        response = bedrock_client.invoke_model(
+            ModelId='your-bedrock-model-id',  # Replace with your Bedrock model ID
+            Body=payload,
+            ContentType='application/json'
+        )
+        response_body = response['Body'].read().decode('utf-8')
+        result = json.loads(response_body)
+        embedding = result['embedding']
+        return embedding
+    except Exception as e:
+        print(f"Error getting embedding: {e}")
+        return None
+
+# Generate embeddings for each PDF's text.
+bedrock_embeddings = []
+for i, text in enumerate(pdf_texts):
+    print(f"Getting embedding for PDF {i+1}/{len(pdf_texts)}")
+    emb = get_bedrock_embedding(text)
+    if emb is not None:
+        bedrock_embeddings.append(emb)
+    else:
+        # In case of failure, append a zero vector (or you could skip the document)
+        bedrock_embeddings.append([0.0]*768)  # Adjust dimension as needed
+
+bedrock_embeddings = np.array(bedrock_embeddings)
+print("Obtained embeddings for all PDFs.")
+
+# %% [markdown]
+# ## Initial Clustering using Agglomerative Clustering
+# 
+# We compute cosine similarity and then cluster the PDFs. Adjust the `distance_threshold` based on how tightly you want similar documents grouped.
+
+# %% [code]
+# Compute cosine similarity matrix and convert to distances.
+cos_sim = cosine_similarity(bedrock_embeddings)
+cos_dist = 1 - cos_sim
+
+initial_clusterer = AgglomerativeClustering(
+    affinity='precomputed',
+    linkage='average',
+    distance_threshold=0.3,  # Adjust this threshold as needed
+    n_clusters=None
+)
+labels_initial = initial_clusterer.fit_predict(cos_dist)
+print(f"Initial clustering produced {len(set(labels_initial))} clusters.")
+
+# Group document indices by their initial cluster label.
+clusters_initial = defaultdict(list)
+for idx, label in enumerate(labels_initial):
+    clusters_initial[label].append(idx)
+
+# %% [markdown]
+# ## Subdivide Clusters to Ensure a Maximum Size of 100
+# 
+# For any initial cluster with more than 100 PDFs, we subdivide it using KMeans clustering.
+
+# %% [code]
+def subdivide_cluster(indices, embeddings, max_size=100):
+    """Subdivide a cluster into smaller clusters, each with at most max_size elements."""
+    if len(indices) <= max_size:
+        return [indices]
+    n_subclusters = math.ceil(len(indices) / max_size)
+    sub_embeds = embeddings[indices]
+    kmeans = KMeans(n_clusters=n_subclusters, random_state=42)
+    sub_labels = kmeans.fit_predict(sub_embeds)
+    subclusters = defaultdict(list)
+    for orig_idx, sub_label in zip(indices, sub_labels):
+        subclusters[sub_label].append(orig_idx)
+    return list(subclusters.values())
+
+final_clusters = []
+for label, indices in clusters_initial.items():
+    if len(indices) > 100:
+        subclusters = subdivide_cluster(indices, bedrock_embeddings, max_size=100)
+        final_clusters.extend(subclusters)
+    else:
+        final_clusters.append(indices)
+
+print(f"After subdivision, total clusters: {len(final_clusters)}")
+
+# %% [markdown]
+# ## Combine PDFs in Each Cluster
+# 
+# For each final cluster, we combine the text of the PDFs into a single text file with headers indicating the original file names.
+# 
+# You can then use these combined files as a unified knowledge source.
+
+# %% [code]
+for cluster_num, indices in enumerate(final_clusters):
+    combined_text = ""
+    for idx in indices:
+        pdf_file = os.path.basename(valid_pdf_paths[idx])
+        combined_text += f"\n=== Content from {pdf_file} ===\n"
+        combined_text += pdf_texts[idx] + "\n"
+    output_path = os.path.join(output_directory, f"cluster_{cluster_num}.txt")
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(combined_text)
+    print(f"Saved cluster {cluster_num} with {len(indices)} PDFs to {output_path}")
+
+# %% [markdown]
+# ## (Optional) Upload Combined Clusters Back to S3
+# 
+# If you wish to store the combined clusters in an S3 bucket, use the following code.
+
+# %% [code]
+output_bucket = 'your-output-bucket-name'  # Replace with your output S3 bucket name
+output_prefix = 'combined-clusters/'         # (Optional) specify an S3 prefix
+
+for filename in os.listdir(output_directory):
+    local_path = os.path.join(output_directory, filename)
+    s3_key = os.path.join(output_prefix, filename)
+    s3_client.upload_file(local_path, output_bucket, s3_key)
+    print(f"Uploaded {local_path} to s3://{output_bucket}/{s3_key}")
